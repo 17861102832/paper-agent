@@ -4,14 +4,18 @@
 PaperAgent —— 论文 Agent（单文件）
 
 用法：
-  python paper_agent.py new "论文题目" [--key sk-xxx]   # 立项并开始自动写作
-  python paper_agent.py chat [--key sk-xxx]             # 交互模式：给它下自然语言指令
-  python paper_agent.py resume <slug>                   # 断点续写
+  python paper_agent.py new "论文题目" [--base-url URL] [--model 名] [--key sk-xxx]
+  python paper_agent.py chat [--base-url URL] [--model 名] [--key sk-xxx]
+  python paper_agent.py resume <slug>
 
-它自己会：选题定位 → 列大纲 → 逐节起草 → 自我审稿改稿 → 参考文献 -> 引用体检 → 出终稿。
+它自己会：选题定位 → 列大纲 → 逐节起草 → 自我审稿改稿 → 参考文献 → 引用体检 → 出终稿。
 所有工作落在 ./papers/<slug>/ 里，随时 Ctrl+C，下次 resume 接着干。
 
-API Key 三选一：--key 参数 / 环境变量 DEEPSEEK_API_KEY / 首次运行时输入。
+API 通用：任何 OpenAI 兼容端点都能接（OpenAI / DeepSeek / Kimi / 通义 / Ollama 本地 / 任意中转）。
+三个参数的三种给法（命令行 > 环境变量 > 运行时询问）：
+  --base-url  URL   默认 https://api.deepseek.com            环境变量 OPENAI_BASE_URL
+  --model     MODEL 默认 deepseek-chat                       环境变量 OPENAI_MODEL
+  --key       KEY   可留空（运行时询问）                      环境变量 OPENAI_API_KEY
 """
 
 import json
@@ -23,8 +27,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-API_URL = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-chat"
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-chat"
 BASE = Path(__file__).resolve().parent
 PAPERS = BASE / "papers"
 MAX_TOKENS = 4096
@@ -50,16 +54,23 @@ TOOLS = [
 
 
 class LLM:
-    def __init__(self, key: str):
+    """OpenAI 兼容客户端。base_url 传裸域名或完整地址都会归一到 /chat/completions。"""
+
+    def __init__(self, base_url: str, model: str, key: str):
+        u = base_url.strip().rstrip("/")
+        if not u.endswith("/chat/completions"):
+            u += "/chat/completions"
+        self.url = u
+        self.model = model
         self.key = key
 
     def chat(self, msgs, json_mode=False, temperature=0.7) -> str:
-        payload = {"model": MODEL, "messages": msgs, "temperature": temperature}
+        payload = {"model": self.model, "messages": msgs, "temperature": temperature}
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
-            API_URL, data=data,
+            self.url, data=data,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"},
         )
         ctx = ssl.create_default_context()
@@ -213,26 +224,42 @@ def build_agent(llm: LLM, st: State, user_text, stage="idle"):
     return f"{msg}（动作 {action} 已尝试执行）"
 
 
+def parse_opts(rest):
+    """命令行参数: --base-url / --model / --key（可混在任何位置）。"""
+    env = os.environ
+    cfg = {
+        "base_url": env.get("OPENAI_BASE_URL", DEFAULT_BASE_URL),
+        "model": env.get("OPENAI_MODEL", DEFAULT_MODEL),
+        "key": env.get("OPENAI_API_KEY", ""),
+    }
+    for flag, name in [("--base-url", "base_url"), ("--model", "model"), ("--key", "key")]:
+        if flag in rest:
+            i = rest.index(flag)
+            cfg[name] = rest[i + 1]
+            del rest[i:i + 2]
+    return cfg, rest
+
+
 def main():
     args = sys.argv[1:]
     if not args:
         print(__doc__)
         return
     cmd, rest = args[0], args[1:]
-    key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if "--key" in rest:
-        i = rest.index("--key")
-        key = rest[i + 1]
-        del rest[i:i + 2]
+    cfg, rest = parse_opts(rest)
+
+    def make_llm():
+        cfg["key"] = cfg["key"] or input("API Key（OpenAI 兼容，任意服务商）: ").strip()
+        print(f"已连接模型 {cfg['model']} @ {cfg['base_url']}")
+        return LLM(cfg["base_url"], cfg["model"], cfg["key"])
 
     if cmd == "new" and rest:
         topic = " ".join(rest)
-        key = key or input("DeepSeek API Key: ").strip()
+        llm = make_llm()
         slug = slip(topic)
         st = State(slug)
         st.d["topic"] = topic
         st.save()
-        llm = LLM(key)
         print(f"项目 {slug} 立项：《{topic}》")
         out = build_agent(llm, st, f"新论文《{topic}》，从选题定位开始，然后大纲，然后逐节起草，全部自动完成。")
         print("\n" + out)
@@ -240,15 +267,13 @@ def main():
     if cmd == "resume" and rest:
         slug = rest[0]
         st = State(slug)
-        key = key or input("DeepSeek API Key: ").strip()
-        llm = LLM(key)
+        llm = make_llm()
         print(f"恢复项目 {slug}（阶段延续，文件：{', '.join(st.d['files'])}）")
         out = build_agent(llm, st, "继续推进论文：接着写未完成的章节，写完就审稿、修稿、汇总参考文献、体检、出终稿。")
         print("\n" + out)
         return
     if cmd == "chat":
-        key = key or input("DeepSeek API Key: ").strip()
-        llm = LLM(key)
+        llm = make_llm()
         slug = input("项目名（新项目直接给标题）: ").strip()
         st = State(slip(slug))
         if not st.d["topic"]:
